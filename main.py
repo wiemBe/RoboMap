@@ -5,9 +5,11 @@ import heapq
 import requests
 import json
 import time
+import serial
+import serial.tools.list_ports
 
 class IndoorMap:
-    def __init__(self, length=25, width=30, resolution=1):
+    def __init__(self, length=25, width=30, resolution=0.2):
         # resolution in meters (e.g., 1 means 1 meter per cell)
         self.resolution = resolution
         
@@ -121,7 +123,7 @@ class IndoorMapGUI(IndoorMap):
     def __init__(self):
         super().__init__()
         pygame.init()
-        self.CELL_SIZE = 20
+        self.CELL_SIZE = 10
         self.WIDTH = len(self.matrix[0]) * self.CELL_SIZE
         self.HEIGHT = len(self.matrix) * self.CELL_SIZE
         self.screen = pygame.display.set_mode((self.WIDTH, self.HEIGHT))
@@ -130,10 +132,64 @@ class IndoorMapGUI(IndoorMap):
         # Colors
         self.WHITE = (255, 255, 255)
         self.BLACK = (0, 0, 0)
-        self.RED = (255, 0, 0)
+        self.YELLOW = (255, 255, 0)
         self.GREEN = (0, 255, 0)
         self.BLUE = (0, 0, 255)
-        self.YELLOW = (255, 255, 0)  # Color for current location
+        
+        # Movement control flags
+        self.autonomous_mode = False
+        self.current_path = []
+        self.path_index = 0
+        
+        # Arduino setup
+        self.arduino = None
+        self.connect_arduino()
+
+    def connect_arduino(self):
+        """Attempt to connect to Arduino"""
+        try:
+            # Directly connect to COM6
+            self.arduino = serial.Serial('COM6', 9600, timeout=1)
+            print("Connected to Arduino on COM6")
+        except Exception as e:
+            print(f"Error connecting to Arduino: {e}")
+    
+    def send_movement_command(self, direction):
+        """Send movement command to Arduino"""
+        if not self.arduino:
+            return
+            
+        try:
+            # Define command protocol (adjust based on your Arduino code)
+            commands = {
+                'UP': 'F',    # Forward
+                'DOWN': 'B',  # Backward
+                'LEFT': 'L',  # Left
+                'RIGHT': 'R', # Right
+                'STOP': 'S'   # Stop
+            }
+            
+            if direction in commands:
+                self.arduino.write(commands[direction].encode())
+                # Wait for acknowledgment if needed
+                # response = self.arduino.readline().decode().strip()
+        except Exception as e:
+            print(f"Error sending command to Arduino: {e}")
+
+    def calculate_direction(self, current_pos, next_pos):
+        """Calculate direction based on current and next position"""
+        curr_row, curr_col = current_pos
+        next_row, next_col = next_pos
+        
+        if next_row < curr_row:
+            return 'UP'
+        elif next_row > curr_row:
+            return 'DOWN'
+        elif next_col < curr_col:
+            return 'LEFT'
+        elif next_col > curr_col:
+            return 'RIGHT'
+        return 'STOP'
 
     def draw_map(self, path=None):
         self.screen.fill(self.WHITE)
@@ -216,77 +272,126 @@ class IndoorMapGUI(IndoorMap):
                     return True
         return False
 
-    def run(self):
-        last_poll_time = 0
-        poll_interval = 0.5  # Poll every 0.5 seconds
-        clock = pygame.time.Clock()
-        current_poi = None
+    def get_cell_from_mouse(self, mouse_pos):
+        """Convert mouse coordinates to grid cell coordinates"""
+        x, y = mouse_pos
+        row = y // self.CELL_SIZE
+        col = x // self.CELL_SIZE
         
+        # Ensure coordinates are within bounds
+        row = max(0, min(row, self.rows - 1))
+        col = max(0, min(col, self.cols - 1))
+        
+        return (row, col)
+
+    def move_along_path(self):
+        """Move one step along the current path based on the mouse position"""
+        if not self.current_path or self.path_index >= len(self.current_path) - 1:
+            self.autonomous_mode = False
+            if self.arduino:
+                self.send_movement_command('STOP')
+            print("Path completed or no valid path.")
+            return False
+
+        next_pos = self.current_path[self.path_index + 1]
+
+        # Check if we've manually moved closer to the next position
+        if self.current_location == next_pos:
+            self.path_index += 1  # Progress along the path
+
+        else:
+            # Calculate direction and send commands
+            direction = self.calculate_direction(self.current_location, next_pos)
+            if self.arduino:
+                self.send_movement_command(direction)
+            
+            # Update the display, keeping the path highlighted
+            self.update_current_location(next_pos)
+            self.path_index += 1
+        
+        # Check if we reached the target POI
+        if self.check_if_on_poi():
+            print("Arrived at Point of Interest!")
+            self.autonomous_mode = False
+            return False
+
+        return True
+
+    def run(self):
+        pygame.event.set_grab(True)
+        clock = pygame.time.Clock()
         running = True
+        last_mouse_pos = pygame.mouse.get_pos()
+        move_delay = 0.5  # Delay between autonomous moves (seconds)
+        last_move_time = time.time()
+
         while running:
-            current_time = time.time()
-            
-            # Regular polling for POI updates
-            if current_time - last_poll_time >= poll_interval:
-                try:
-                    response = requests.get('http://localhost:8080/available')
-                    if response.status_code == 200:
-                        data = response.json()
-                        new_poi = str(data.get('station'))
-                        
-                        # Only update if POI has changed and we're not currently on a POI
-                        if new_poi != current_poi and not self.check_if_on_poi():
-                            current_poi = new_poi
-                            # Clear existing POIs
-                            self.matrix[self.matrix == 2] = 0
-                            # Set new POI
-                            if new_poi in self.poi_locations:
-                                location = self.poi_locations[new_poi]
-                                self.matrix[location] = 2
-                                print(f"New target POI {new_poi} at location {location}")
-                except Exception as e:
-                    print(f"Server polling error: {e}")
-                last_poll_time = current_time
-            
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    if self.arduino:
+                        self.arduino.close()
                     running = False
+
                 elif event.type == pygame.KEYDOWN:
-                    row, col = self.current_location
-                    
-                    # Handle movement
-                    if event.key == pygame.K_UP and self.matrix[row-1][col] != 1:
-                        self.update_current_location((row-1, col))
-                        if self.check_if_on_poi():
-                            current_poi = None  # Reset current POI when reached
-                    elif event.key == pygame.K_DOWN and self.matrix[row+1][col] != 1:
-                        self.update_current_location((row+1, col))
-                        if self.check_if_on_poi():
-                            current_poi = None  # Reset current POI when reached
-                    elif event.key == pygame.K_LEFT and self.matrix[row][col-1] != 1:
-                        self.update_current_location((row, col-1))
-                        if self.check_if_on_poi():
-                            current_poi = None  # Reset current POI when reached
-                    elif event.key == pygame.K_RIGHT and self.matrix[row][col+1] != 1:
-                        self.update_current_location((row, col+1))
-                        if self.check_if_on_poi():
-                            current_poi = None  # Reset current POI when reached
-            
-            # Calculate path only when needed
-            if self.matrix[self.matrix == 2].any():  # Check if any POI exists
-                nearest_poi = self.find_nearest_poi(self.current_location)
-                if nearest_poi:
-                    path = self.find_path(self.current_location, nearest_poi)
-                else:
-                    path = []
-            else:
-                path = []
-                
-            self.draw_map(path)
-            pygame.display.flip()
-            clock.tick(30)  # Limit to 30 FPS
+                        if event.key == pygame.K_ESCAPE:
+                            pygame.event.set_grab(False)
+                            print("Escape key pressed. Ungrabbing mouse.")
+                        # Toggle autonomous mode
+                        self.autonomous_mode = not self.autonomous_mode
+                        if self.autonomous_mode:
+                            nearest_poi = self.find_nearest_poi(self.current_location)
+                            if nearest_poi:
+                                self.current_path = self.find_path(self.current_location, nearest_poi)
+                                self.path_index = 0
+                        else:
+                            if self.arduino:
+                                self.send_movement_command('STOP')
+
+            # Track mouse movement for manual updates
+            current_mouse_pos = pygame.mouse.get_pos()
+            dx = current_mouse_pos[0] - last_mouse_pos[0]
+            dy = current_mouse_pos[1] - last_mouse_pos[1]
+            last_mouse_pos = current_mouse_pos
+
+            # Convert mouse movement to grid updates
+            cell_dx = dx // self.CELL_SIZE
+            cell_dy = dy // self.CELL_SIZE
+
+            if cell_dx != 0 or cell_dy != 0:
+                new_row = self.current_location[0] + cell_dy
+                new_col = self.current_location[1] + cell_dx
+
+                # Ensure the new position is valid
+                if (0 <= new_row < self.rows and 0 <= new_col < self.cols 
+                        and self.matrix[new_row][new_col] != 1):
+                    self.update_current_location((new_row, new_col))
+                    print(f"Moved to grid: ({new_row}, {new_col})")
+
+                    # Check if reached a POI
+                    if self.check_if_on_poi():
+                        print("Reached POI!")
+                        self.autonomous_mode = False
+                    else:
+                        # Recalculate the path dynamically
+                        nearest_poi = self.find_nearest_poi(self.current_location)
+                        if nearest_poi:
+                            print("Recalculating path to nearest POI...")
+                            self.current_path = self.find_path(self.current_location, nearest_poi)
+                            self.path_index = 0
+
+            # Handle autonomous path-following
+            if self.autonomous_mode and time.time() - last_move_time >= move_delay:
+                if not self.move_along_path():
+                    print("Path completed.")
+                last_move_time = time.time()
+
+            # Draw the map
+            path_to_draw = self.current_path if self.autonomous_mode else []
+            self.draw_map(path_to_draw)
+            clock.tick(30)
 
         pygame.quit()
+
 
 if __name__ == "__main__":
     gui = IndoorMapGUI()
