@@ -30,9 +30,9 @@ class IndoorMap:
         self.width_meters = width
 
     def update_current_location(self, new_position):
-        self.matrix[self.current_location] = 0
+        self.matrix[self.current_location] = 0  # Clear old position
         self.current_location = new_position
-        self.matrix[new_position] = 3
+        self.matrix[new_position] = 3  # Mark new position
 
     def get_cell_size(self):
         return f"Each cell represents {self.resolution}x{self.resolution} meters"

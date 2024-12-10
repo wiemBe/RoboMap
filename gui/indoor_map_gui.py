@@ -25,6 +25,8 @@ class IndoorMapGUI(IndoorMap):
         self.path_index = 0
         self.arduino = None
         self.connect_arduino()
+        self.mouse_sensor = MouseSensor()
+        self.start_row, self.start_col = self.current_location
 
     def connect_arduino(self):
         try:
@@ -160,6 +162,20 @@ class IndoorMapGUI(IndoorMap):
             return False
         return True
 
+    def update_position_from_sensor(self):
+        parsed_data = self.mouse_sensor.read_and_parse_data()
+        if parsed_data:
+            x_mm, y_mm = self.mouse_sensor.get_displacement_mm()
+            # Convert mm to grid cells
+            col_offset = int(x_mm / (self.resolution * 1000))
+            row_offset = int(y_mm / (self.resolution * 1000))
+            new_row = self.start_row - row_offset
+            new_col = self.start_col + col_offset
+            new_position = (new_row, new_col)
+            # Ensure new position is within bounds
+            if 0 <= new_row < self.rows and 0 <= new_col < self.cols:
+                self.update_current_location(new_position)
+
     def run(self):
         clock = pygame.time.Clock()
         running = True
@@ -182,6 +198,8 @@ class IndoorMapGUI(IndoorMap):
                             else:
                                 print("No active POI available")
 
+            self.update_position_from_sensor()
+
             if self.autonomous_mode and time.time() - last_move_time >= move_delay:
                 self.fetch_pois_from_server()
                 current_target = self.current_path[-1] if self.current_path else None
@@ -199,4 +217,9 @@ class IndoorMapGUI(IndoorMap):
             self.draw_map(path_to_draw)
             clock.tick(30)
 
+        self.close()
+
+    def close(self):
+        if self.mouse_sensor:
+            self.mouse_sensor.close()
         pygame.quit()
