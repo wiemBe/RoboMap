@@ -166,7 +166,7 @@ class IndoorMapGUI(IndoorMap):
         parsed_data = self.mouse_sensor.read_and_parse_data()
         if parsed_data:
             x_mm, y_mm = self.mouse_sensor.get_displacement_mm()
-            # Convert mm to grid cells
+            # Convert mm to grid cells (assuming resolution is in meters)
             col_offset = int(x_mm / (self.resolution * 1000))
             row_offset = int(y_mm / (self.resolution * 1000))
             new_row = self.start_row - row_offset
@@ -179,44 +179,14 @@ class IndoorMapGUI(IndoorMap):
     def run(self):
         clock = pygame.time.Clock()
         running = True
-        last_move_time = time.time()
-        move_delay = 0.5
-
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_SPACE:
-                        self.autonomous_mode = not self.autonomous_mode
-                        if self.autonomous_mode:
-                            self.fetch_pois_from_server()
-                            active_poi = self.find_nearest_poi(self.current_location)
-                            if active_poi:
-                                self.current_path = self.find_path(self.current_location, active_poi)
-                                self.path_index = 0
-                            else:
-                                print("No active POI available")
-
+            
             self.update_position_from_sensor()
-
-            if self.autonomous_mode and time.time() - last_move_time >= move_delay:
-                self.fetch_pois_from_server()
-                current_target = self.current_path[-1] if self.current_path else None
-                if current_target and self.matrix[current_target[0]][current_target[1]] == 2:
-                    if not self.move_along_path():
-                        print("Path completed.")
-                        self.autonomous_mode = False
-                else:
-                    print("Target POI is no longer active")
-                    self.autonomous_mode = False
-                    self.current_path = []
-                last_move_time = time.time()
-
-            path_to_draw = self.current_path if self.autonomous_mode else []
-            self.draw_map(path_to_draw)
+            self.draw_map()
             clock.tick(30)
-
         self.close()
 
     def close(self):
