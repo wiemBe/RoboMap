@@ -14,7 +14,7 @@ class MouseSensor:
         usb.util.claim_interface(self.device, 0)
         self.x_total = 0
         self.y_total = 0
-        self.counts_per_mm = 39  # Example value; adjust based on your sensor
+        self.counts_per_mm = 39  # Counts per mmgit 
 
     def read_data(self):
         try:
