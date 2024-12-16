@@ -1,4 +1,3 @@
-# gui/indoor_map_gui.py
 import pygame
 import time
 import requests
@@ -21,12 +20,20 @@ class IndoorMapGUI(IndoorMap):
         self.GREEN = (0, 255, 0)
         self.BLUE = (0, 0, 255)
         self.autonomous_mode = False
+        self.target_poi = None
         self.current_path = []
         self.path_index = 0
         self.arduino = None
         self.connect_arduino()
         self.mouse_sensor = MouseSensor()
         self.start_row, self.start_col = self.current_location
+        self.active_server_poi = None  # Track active POI from server
+        self.last_sensor_update = time.time()
+        self.position_tolerance = 0.1  # meters
+        self.update_interval = 0.1  # seconds
+        self.last_poi_check = time.time()  # Initialize with current time
+        self.poi_check_interval = 1.0  # Check POI every 1 second
+        self.last_known_poi = None
 
     def connect_arduino(self):
         try:
@@ -47,7 +54,10 @@ class IndoorMapGUI(IndoorMap):
                 'STOP': 'S'
             }
             if direction in commands:
-                self.arduino.write(commands[direction].encode())
+                command = commands[direction]
+                self.arduino.write(command.encode())
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"[{timestamp}] Sent Arduino command: {direction} ({command})")
         except Exception as e:
             print(f"Error sending command to Arduino: {e}")
 
@@ -142,39 +152,173 @@ class IndoorMapGUI(IndoorMap):
 
     def move_along_path(self):
         if not self.current_path or self.path_index >= len(self.current_path) - 1:
-            self.autonomous_mode = False
-            if self.arduino:
-                self.send_movement_command('STOP')
-            print("Path completed or no valid path.")
+            print("\n[AUTONOMOUS] Path completed or invalid")
+            self.stop_movement()
             return False
+
+        # Get next target position
         next_pos = self.current_path[self.path_index + 1]
-        if self.current_location == next_pos:
-            self.path_index += 1
-        else:
-            direction = self.calculate_direction(self.current_location, next_pos)
-            if self.arduino:
+        
+        # Print current navigation state
+        print(f"\n[AUTONOMOUS] Current position: {self.current_location}")
+        print(f"[AUTONOMOUS] Target position: {next_pos}")
+        print(f"[AUTONOMOUS] Progress: {self.path_index + 1}/{len(self.current_path)}")
+        
+        # Update current position from sensor
+        position_updated = self.update_position_from_sensor()
+        
+        if position_updated:
+            # Check if reached next position
+            if self.is_position_reached(next_pos):
+                self.path_index += 1
+                print(f"[AUTONOMOUS] Reached waypoint {self.path_index}")
+                if self.check_if_on_poi():
+                    print("[AUTONOMOUS] Destination POI reached!")
+                    self.stop_movement()
+                    return False
+            else:
+                # Calculate and send movement command
+                direction = self.calculate_direction(self.current_location, next_pos)
+                timestamp = time.strftime("%H:%M:%S")
+                print(f"\n[{timestamp}] NAVIGATION:")
+                print(f"├── Current: {self.current_location}")
+                print(f"├── Target:  {next_pos}")
+                print(f"└── Command: {direction}")
                 self.send_movement_command(direction)
-            self.update_current_location(next_pos)
-            self.path_index += 1
-        if self.check_if_on_poi():
-            print("Arrived at Point of Interest!")
-            self.autonomous_mode = False
-            return False
+        
         return True
 
     def update_position_from_sensor(self):
+        current_time = time.time()
+        if current_time - self.last_sensor_update < self.update_interval:
+            return False
+
         parsed_data = self.mouse_sensor.read_and_parse_data()
         if parsed_data:
             x_mm, y_mm = self.mouse_sensor.get_displacement_mm()
             # Convert mm to grid cells (assuming resolution is in meters)
             col_offset = int(x_mm / (self.resolution * 1000))
             row_offset = int(y_mm / (self.resolution * 1000))
-            new_row = self.start_row - row_offset
+            new_row = self.start_row + row_offset
             new_col = self.start_col + col_offset
             new_position = (new_row, new_col)
             # Ensure new position is within bounds
             if 0 <= new_row < self.rows and 0 <= new_col < self.cols:
                 self.update_current_location(new_position)
+                self.last_sensor_update = current_time
+                return True
+        return False
+
+    def is_position_reached(self, target_pos):
+        curr_row, curr_col = self.current_location
+        target_row, target_col = target_pos
+        
+        # Convert grid positions to meters
+        curr_x = curr_col * self.resolution
+        curr_y = curr_row * self.resolution
+        target_x = target_col * self.resolution
+        target_y = target_row * self.resolution
+        
+        # Check if within tolerance
+        distance = ((curr_x - target_x)**2 + (curr_y - target_y)**2)**0.5
+        return distance <= self.position_tolerance
+
+    def stop_movement(self):
+        if self.arduino:
+            self.send_movement_command('STOP')
+        self.autonomous_mode = False
+
+    def toggle_autonomous_mode(self):
+        self.autonomous_mode = not self.autonomous_mode
+        print(f"Autonomous mode {'enabled' if self.autonomous_mode else 'disabled'}")
+        if self.autonomous_mode:
+            print("Initializing autonomous navigation...")
+            self.start_autonomous_navigation()
+        else:
+            self.stop_autonomous_navigation()
+
+    def start_autonomous_navigation(self):
+        try:
+            print("Fetching POI from server...")
+            response = requests.get('http://localhost:8080/available', timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                active_poi = str(data.get('station'))
+                print(f"Server returned POI: {active_poi}")
+                
+                if active_poi and active_poi in self.poi_locations:
+                    target_location = self.poi_locations[active_poi]
+                    self.active_server_poi = active_poi
+                    self.last_known_poi = active_poi
+                    self.current_path = self.find_path(self.current_location, target_location)
+                    self.path_index = 0
+                    print(f"Path calculated to POI {active_poi} at {target_location}")
+                else:
+                    print(f"Invalid POI from server: {active_poi}")
+                    self.autonomous_mode = False
+            else:
+                print(f"Server returned status code: {response.status_code}")
+                self.autonomous_mode = False
+        except requests.exceptions.RequestException as e:
+            print(f"Server communication error: {e}")
+            self.autonomous_mode = False
+        except Exception as e:
+            print(f"Unexpected error in autonomous navigation: {e}")
+            self.autonomous_mode = False
+
+    def stop_autonomous_navigation(self):
+        self.current_path = []
+        self.path_index = 0
+        if self.arduino:
+            self.send_movement_command('STOP')
+        print("Stopping autonomous navigation")
+
+    def check_and_update_poi(self):
+        current_time = time.time()
+        if current_time - self.last_poi_check < self.poi_check_interval:
+            return False
+
+        self.last_poi_check = current_time  # Update timestamp before request
+        
+        try:
+            print("Checking for POI updates...")
+            response = requests.get('http://localhost:8080/available', timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                active_poi = str(data.get('station'))
+                print(f"Current active POI: {active_poi}")
+                
+                if active_poi != self.last_known_poi:
+                    print(f"POI changed from {self.last_known_poi} to {active_poi}")
+                    self.last_known_poi = active_poi
+                    
+                    # Update map and navigation
+                    self._update_poi_on_map(active_poi)
+                    return True
+        
+        except requests.exceptions.RequestException as e:
+            print(f"Server communication error in POI check: {e}")
+        
+        return False
+
+    def _update_poi_on_map(self, active_poi):
+        # Clear old POIs
+        for i in range(self.rows):
+            for j in range(self.cols):
+                if self.matrix[i][j] == 2:
+                    self.matrix[i][j] = 0
+        
+        # Set new active POI
+        if active_poi in self.poi_locations:
+            location = self.poi_locations[active_poi]
+            self.matrix[location[0]][location[1]] = 2
+            print(f"Updated map with POI {active_poi} at {location}")
+            
+            # Update navigation if in autonomous mode
+            if self.autonomous_mode:
+                self.current_path = self.find_path(self.current_location, location)
+                self.path_index = 0
+                print("Recalculated path for new POI")
 
     def run(self):
         clock = pygame.time.Clock()
@@ -183,10 +327,28 @@ class IndoorMapGUI(IndoorMap):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_a:
+                        self.toggle_autonomous_mode()
             
+            # Regular position update
             self.update_position_from_sensor()
-            self.draw_map()
+            
+            # Check for POI updates
+            poi_updated = self.check_and_update_poi()
+            
+            # Handle autonomous navigation
+            if self.autonomous_mode:
+                if poi_updated or not self.move_along_path():
+                    if self.last_known_poi in self.poi_locations:
+                        target = self.poi_locations[self.last_known_poi]
+                        self.current_path = self.find_path(self.current_location, target)
+                        self.path_index = 0
+            
+            # Draw current state
+            self.draw_map(self.current_path if self.autonomous_mode else None)
             clock.tick(30)
+        
         self.close()
 
     def close(self):
